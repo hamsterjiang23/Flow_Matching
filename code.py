@@ -30,7 +30,7 @@ def sample_data(batch_size, device):
     这就是我们的真实数据 x_0。
     """
     theta = torch.rand(batch_size, device=device) * 2 * math.pi
-    radius = 2.0 + 0.1 * torch.randn(batch_size, device=device)
+    radius = 1.5 + 0.05 * torch.randn(batch_size, device=device)
 
     x = radius * torch.cos(theta)
     y = radius * torch.sin(theta)
@@ -39,8 +39,36 @@ def sample_data(batch_size, device):
 
 
 # =========================
-# 2. 定义速度预测网络
+# 2. 时间步正弦编码 + 速度预测网络
 # =========================
+def get_timestep_embedding(t, embed_dim):
+    """
+    将标量时间步 t ∈ [0,1] 映射为高维正弦编码。
+    类似 Transformer 位置编码，让网络更好地区分不同时间步。
+    """
+    half_dim = embed_dim // 2
+    emb = math.log(10000.0) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
+    emb = t * emb
+    return torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+
+
+class ResBlock(nn.Module):
+    """带 LayerNorm 的残差块"""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+
+    def forward(self, x):
+        return x + self.net(x)
+
+
 class VelocityNet(nn.Module):
     """
     输入:
@@ -49,22 +77,36 @@ class VelocityNet(nn.Module):
 
     输出:
         velocity，shape = (B, 2)
+
+    架构:
+        - 128 维正弦时间编码
+        - 6 个残差块，512 隐藏维度
+        - LayerNorm 稳定训练
     """
 
-    def __init__(self):
+    def __init__(self, hidden_dim=512, num_blocks=6, time_embed_dim=128):
         super().__init__()
+        in_dim = 2 + time_embed_dim
 
-        self.net = nn.Sequential(
-            nn.Linear(3, 128),
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(128, 128),
-            nn.SiLU(),
-            nn.Linear(128, 2),
+        )
+
+        self.blocks = nn.ModuleList([ResBlock(hidden_dim) for _ in range(num_blocks)])
+
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 2),
         )
 
     def forward(self, x_t, t):
-        inp = torch.cat([x_t, t], dim=1)
-        return self.net(inp)
+        t_emb = get_timestep_embedding(t, self.input_proj[0].in_features - 2)
+        h = torch.cat([x_t, t_emb], dim=1)
+        h = self.input_proj(h)
+        for block in self.blocks:
+            h = block(h)
+        return self.output_proj(h)
 
 
 # =========================
@@ -166,27 +208,27 @@ def save_gif(frames, path, duration=300):
 # =========================
 # 7. Flow Matching 训练
 # =========================
-model = VelocityNet().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+model = VelocityNet(hidden_dim=512, num_blocks=6).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-5)
+# 带 warmup 的余弦退火：前 1000 步线性增长，之后余弦衰减
+scheduler1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=1000)
+scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=19000, eta_min=1e-5)
+scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [scheduler1, scheduler2], milestones=[1000])
 
-batch_size = 1024
-num_steps = 5000
+batch_size = 2048
+num_steps = 20000
 
 # 用来观察训练过程的 checkpoint
 save_steps = [
     0,
-    50,
     100,
-    200,
-    300,
     500,
-    800,
     1000,
-    1500,
     2000,
-    3000,
-    4000,
     5000,
+    10000,
+    15000,
+    20000,
 ]
 
 checkpoints = {}
@@ -225,12 +267,14 @@ for step in range(1, num_steps + 1):
 
     optimizer.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
+    scheduler.step()
 
     loss_history.append(loss.item())
 
-    if step % 500 == 0:
-        print(f"step {step}, loss = {loss.item():.4f}")
+    if step % 1000 == 0:
+        print(f"step {step}, loss = {loss.item():.4f}, lr = {scheduler.get_last_lr()[0]:.2e}")
 
     if step in save_steps:
         checkpoints[step] = copy.deepcopy(model.state_dict())
